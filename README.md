@@ -1,16 +1,19 @@
 # AndPad
 
-AndPad は、Android 端末を Bluetooth HID デバイスとして動作させ、PC 向けの仮想タッチパッドとして利用するための Flutter アプリケーションです。
+AndPad は、Android 端末を Bluetooth HID デバイスとして動作させ、PC 向けの仮想タッチパッドおよびキーボードとして利用するための Flutter アプリケーションです。
 
-本アプリケーションは Android の Bluetooth HID Device Profile を使用し、マウス移動、左クリック、右クリック、スクロール操作を PC に送信します。
+本アプリケーションは Android の Bluetooth HID Device Profile を使用し、マウス移動、左クリック、右クリック、スクロール操作、キーボード入力を PC に送信します。
 
 ## 機能
 
 - Bluetooth HID による仮想マウス操作
+- Bluetooth HID による仮想キーボード操作
 - タッチパッド領域でのカーソル移動
 - 左クリックおよび右クリック
 - 専用スクロール領域によるホイール操作
 - ダブルタップによるドラッグロック
+- Touchpad/Keyboard モード切り替え
+- 英数字、Shift、Caps、Tab、Backspace、Enter、Space キー入力
 - 接続済み PC への自動再接続
 - 感度、スクロール速度、スクロール方向、振動フィードバックの設定
 - 縦向きおよび横向きレイアウトの切り替え
@@ -65,7 +68,9 @@ adb install -r build/app/outputs/flutter-apk/app-release.apk
 3. AndPad から端末を検出可能にします。
 4. PC と Android 端末をペアリングします。
 5. AndPad の `PC Connect` から接続先 PC を選択します。
-6. 接続完了後、画面上のタッチパッド領域を使用して PC のカーソルを操作します。
+6. 接続完了後、画面上の `Touchpad` / `Keyboard` 切り替えで操作モードを選択します。
+7. `Touchpad` ではカーソル、クリック、スクロールを操作できます。
+8. `Keyboard` ではオンスクリーンキーから PC へ文字や制御キーを送信できます。
 
 HID の登録情報を変更した場合、または PC 側が旧設定を保持している場合は、PC 側で一度ペアリング情報を削除してから再ペアリングしてください。
 

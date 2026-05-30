@@ -36,12 +36,22 @@ class MainActivity : FlutterActivity() {
     private var connectedDevice: BluetoothDevice? = null
     private var isAppRegistered = false
     private var currentConnectionState = BluetoothProfile.STATE_DISCONNECTED
+    private var currentProtocol = BluetoothHidDevice.PROTOCOL_REPORT_MODE
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private var permissionResult: MethodChannel.Result? = null
     private val PERMISSION_REQUEST_CODE = 1001
 
-    // HID Report Descriptor for a 5-button Mouse with a vertical scroll wheel
+    private fun sendHidDebugEvent(action: String, detail: String) {
+        runOnUiThread {
+            channel?.invokeMethod("onHidDebugEvent", mapOf(
+                "action" to action,
+                "detail" to detail
+            ))
+        }
+    }
+
+    // HID Report Descriptor for a 5-button Mouse and a boot keyboard.
     private val HID_DESCRIPTOR = byteArrayOf(
         0x05.toByte(), 0x01.toByte(), // USAGE_PAGE (Generic Desktop)
         0x09.toByte(), 0x02.toByte(), // USAGE (Mouse)
@@ -84,6 +94,50 @@ class MainActivity : FlutterActivity() {
         0x81.toByte(), 0x06.toByte(), //     INPUT (Data,Var,Rel)
         
         0xc0.toByte(),                //   END_COLLECTION
+        0xc0.toByte(),                // END_COLLECTION
+
+        0x05.toByte(), 0x01.toByte(), // USAGE_PAGE (Generic Desktop)
+        0x09.toByte(), 0x06.toByte(), // USAGE (Keyboard)
+        0xa1.toByte(), 0x01.toByte(), // COLLECTION (Application)
+        0x85.toByte(), 0x02.toByte(), //   REPORT_ID (2)
+
+        // Modifier keys: Left Ctrl through Right GUI
+        0x05.toByte(), 0x07.toByte(), //   USAGE_PAGE (Keyboard)
+        0x19.toByte(), 0xe0.toByte(), //   USAGE_MINIMUM (Keyboard LeftControl)
+        0x29.toByte(), 0xe7.toByte(), //   USAGE_MAXIMUM (Keyboard Right GUI)
+        0x15.toByte(), 0x00.toByte(), //   LOGICAL_MINIMUM (0)
+        0x25.toByte(), 0x01.toByte(), //   LOGICAL_MAXIMUM (1)
+        0x75.toByte(), 0x01.toByte(), //   REPORT_SIZE (1)
+        0x95.toByte(), 0x08.toByte(), //   REPORT_COUNT (8)
+        0x81.toByte(), 0x02.toByte(), //   INPUT (Data,Var,Abs)
+
+        // Reserved byte
+        0x95.toByte(), 0x01.toByte(), //   REPORT_COUNT (1)
+        0x75.toByte(), 0x08.toByte(), //   REPORT_SIZE (8)
+        0x81.toByte(), 0x03.toByte(), //   INPUT (Cnst,Var,Abs)
+
+        // LED output report: Num Lock through Kana
+        0x95.toByte(), 0x05.toByte(), //   REPORT_COUNT (5)
+        0x75.toByte(), 0x01.toByte(), //   REPORT_SIZE (1)
+        0x05.toByte(), 0x08.toByte(), //   USAGE_PAGE (LEDs)
+        0x19.toByte(), 0x01.toByte(), //   USAGE_MINIMUM (Num Lock)
+        0x29.toByte(), 0x05.toByte(), //   USAGE_MAXIMUM (Kana)
+        0x91.toByte(), 0x02.toByte(), //   OUTPUT (Data,Var,Abs)
+
+        // LED output padding
+        0x95.toByte(), 0x01.toByte(), //   REPORT_COUNT (1)
+        0x75.toByte(), 0x03.toByte(), //   REPORT_SIZE (3)
+        0x91.toByte(), 0x03.toByte(), //   OUTPUT (Cnst,Var,Abs)
+
+        // Six simultaneous key slots
+        0x95.toByte(), 0x06.toByte(), //   REPORT_COUNT (6)
+        0x75.toByte(), 0x08.toByte(), //   REPORT_SIZE (8)
+        0x15.toByte(), 0x00.toByte(), //   LOGICAL_MINIMUM (0)
+        0x25.toByte(), 0x65.toByte(), //   LOGICAL_MAXIMUM (101)
+        0x05.toByte(), 0x07.toByte(), //   USAGE_PAGE (Keyboard)
+        0x19.toByte(), 0x00.toByte(), //   USAGE_MINIMUM (Reserved)
+        0x29.toByte(), 0x65.toByte(), //   USAGE_MAXIMUM (Keyboard Application)
+        0x81.toByte(), 0x00.toByte(), //   INPUT (Data,Ary,Abs)
         0xc0.toByte()                 // END_COLLECTION
     )
 
@@ -101,11 +155,13 @@ class MainActivity : FlutterActivity() {
             currentConnectionState = state
             if (state == BluetoothProfile.STATE_CONNECTED) {
                 connectedDevice = device
+                currentProtocol = BluetoothHidDevice.PROTOCOL_REPORT_MODE
             } else if (state == BluetoothProfile.STATE_DISCONNECTED) {
                 if (connectedDevice?.address == device?.address) {
                     connectedDevice = null
                 }
             }
+            sendHidDebugEvent("connection", "state=$state device=${device?.name ?: ""}")
             runOnUiThread {
                 channel?.invokeMethod("onConnectionStateChanged", mapOf(
                     "state" to state,
@@ -113,6 +169,62 @@ class MainActivity : FlutterActivity() {
                     "deviceAddress" to (device?.address ?: "")
                 ))
             }
+        }
+
+        override fun onGetReport(device: BluetoothDevice?, type: Byte, id: Byte, bufferSize: Int) {
+            super.onGetReport(device, type, id, bufferSize)
+            sendHidDebugEvent("getReport", "type=${type.toInt()} id=${id.toInt()} size=$bufferSize")
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P || device == null) {
+                return
+            }
+
+            try {
+                if (!hasBluetoothConnectPermission()) {
+                    return
+                }
+
+                val reportData = when (id.toInt()) {
+                    0 -> ByteArray(8) // Boot keyboard report.
+                    1 -> ByteArray(4) // Mouse: buttons, dx, dy, wheel.
+                    2 -> ByteArray(8) // Keyboard: modifiers, reserved, six key slots.
+                    else -> null
+                }
+
+                if (reportData == null) {
+                    hidDevice?.reportError(device, BluetoothHidDevice.ERROR_RSP_INVALID_RPT_ID)
+                } else {
+                    hidDevice?.replyReport(device, type, id, reportData)
+                }
+            } catch (e: SecurityException) {
+                e.printStackTrace()
+            }
+        }
+
+        override fun onSetReport(device: BluetoothDevice?, type: Byte, id: Byte, data: ByteArray?) {
+            super.onSetReport(device, type, id, data)
+            sendHidDebugEvent("setReport", "type=${type.toInt()} id=${id.toInt()} bytes=${data?.size ?: 0}")
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P || device == null) {
+                return
+            }
+
+            try {
+                if (hasBluetoothConnectPermission()) {
+                    hidDevice?.reportError(device, BluetoothHidDevice.ERROR_RSP_SUCCESS)
+                }
+            } catch (e: SecurityException) {
+                e.printStackTrace()
+            }
+        }
+
+        override fun onSetProtocol(device: BluetoothDevice?, protocol: Byte) {
+            super.onSetProtocol(device, protocol)
+            currentProtocol = protocol
+            val protocolName = if (protocol == BluetoothHidDevice.PROTOCOL_BOOT_MODE) {
+                "boot"
+            } else {
+                "report"
+            }
+            sendHidDebugEvent("setProtocol", protocolName)
         }
     }
 
@@ -195,9 +307,9 @@ class MainActivity : FlutterActivity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && hidDevice != null && !isAppRegistered) {
             val sdp = BluetoothHidDeviceAppSdpSettings(
                 "AndPad Touchpad",
-                "Virtual Bluetooth Mouse and Touchpad",
+                "Virtual Bluetooth Mouse and Keyboard",
                 "AndPad",
-                BluetoothHidDevice.SUBCLASS1_MOUSE,
+                BluetoothHidDevice.SUBCLASS1_COMBO,
                 HID_DESCRIPTOR
             )
             val executor = Executors.newSingleThreadExecutor()
@@ -233,6 +345,7 @@ class MainActivity : FlutterActivity() {
         closeHidProfile()
         connectedDevice = null
         currentConnectionState = BluetoothProfile.STATE_DISCONNECTED
+        currentProtocol = BluetoothHidDevice.PROTOCOL_REPORT_MODE
         isAppRegistered = false
         mainHandler.postDelayed({
             initHidProfile()
@@ -284,6 +397,12 @@ class MainActivity : FlutterActivity() {
                 val dy = call.argument<Int>("dy") ?: 0
                 val wheel = call.argument<Int>("wheel") ?: 0
                 val success = sendMouseEvent(buttons.toByte(), dx.toByte(), dy.toByte(), wheel.toByte())
+                result.success(success)
+            }
+            "sendKeyboardEvent" -> {
+                val modifiers = call.argument<Int>("modifiers") ?: 0
+                val keyCodes = call.argument<List<Int>>("keyCodes") ?: emptyList()
+                val success = sendKeyboardEvent(modifiers.toByte(), keyCodes)
                 result.success(success)
             }
             "getConnectionState" -> {
@@ -509,6 +628,62 @@ class MainActivity : FlutterActivity() {
                 }
                 val reportData = byteArrayOf(buttons, dx, dy, wheel)
                 val sent = hidDevice?.sendReport(device, 1, reportData) ?: false
+                if (!sent) {
+                    currentConnectionState = BluetoothProfile.STATE_DISCONNECTED
+                    connectedDevice = null
+                    runOnUiThread {
+                        channel?.invokeMethod("onConnectionStateChanged", mapOf(
+                            "state" to BluetoothProfile.STATE_DISCONNECTED,
+                            "deviceName" to "",
+                            "deviceAddress" to ""
+                        ))
+                    }
+                }
+                sent
+            } else {
+                false
+            }
+        } catch (e: SecurityException) {
+            false
+        }
+    }
+
+    private fun sendKeyboardEvent(modifiers: Byte, keyCodes: List<Int>): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P || hidDevice == null) {
+            return false
+        }
+        return try {
+            if (hasBluetoothConnectPermission()) {
+                val actualDevice = hidDevice?.connectedDevices?.firstOrNull()
+                val device = actualDevice ?: connectedDevice ?: return false
+                if (actualDevice == null && currentConnectionState == BluetoothProfile.STATE_CONNECTED) {
+                    currentConnectionState = BluetoothProfile.STATE_DISCONNECTED
+                    connectedDevice = null
+                    runOnUiThread {
+                        channel?.invokeMethod("onConnectionStateChanged", mapOf(
+                            "state" to BluetoothProfile.STATE_DISCONNECTED,
+                            "deviceName" to "",
+                            "deviceAddress" to ""
+                        ))
+                    }
+                    return false
+                }
+
+                val reportData = ByteArray(8)
+                reportData[0] = modifiers
+                keyCodes.take(6).forEachIndexed { index, keyCode ->
+                    reportData[index + 2] = keyCode.toByte()
+                }
+                val reportId = if (currentProtocol == BluetoothHidDevice.PROTOCOL_BOOT_MODE) {
+                    0
+                } else {
+                    2
+                }
+                val sent = hidDevice?.sendReport(device, reportId, reportData) ?: false
+                sendHidDebugEvent(
+                    "sendKeyboard",
+                    "reportId=$reportId protocol=${currentProtocol.toInt()} sent=$sent data=${reportData.joinToString(",") { it.toUByte().toString(16) }}"
+                )
                 if (!sent) {
                     currentConnectionState = BluetoothProfile.STATE_DISCONNECTED
                     connectedDevice = null
