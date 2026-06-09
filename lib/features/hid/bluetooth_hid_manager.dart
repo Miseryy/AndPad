@@ -9,6 +9,7 @@ class BluetoothHidManager {
   static const int stateDisconnecting = 3;
 
   Function(bool)? onBluetoothStateChanged;
+  Function(bool)? onHidProfileAvailabilityChanged;
   Function(bool)? onAppStatusChanged;
   Function(int state, String name, String address)? onConnectionStateChanged;
   Function(String action, String detail)? onHidDebugEvent;
@@ -21,6 +22,9 @@ class BluetoothHidManager {
     switch (call.method) {
       case 'onBluetoothStateChanged':
         onBluetoothStateChanged?.call(call.arguments as bool);
+        break;
+      case 'onHidProfileAvailabilityChanged':
+        onHidProfileAvailabilityChanged?.call(call.arguments as bool);
         break;
       case 'onAppStatusChanged':
         onAppStatusChanged?.call(call.arguments as bool);

@@ -33,11 +33,18 @@ class MainActivity : FlutterActivity() {
     private var bluetoothManager: BluetoothManager? = null
     private var bluetoothAdapter: BluetoothAdapter? = null
     private var hidDevice: BluetoothHidDevice? = null
+    private var isHidProfileInitializationPending = false
+    private var isHidProfileAvailable = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+    private var hidProfileInitializationAttemptId = 0
     private var connectedDevice: BluetoothDevice? = null
     private var isAppRegistered = false
+    private var isAppRegistrationPending = false
+    private var pendingConnectionAddress: String? = null
     private var currentConnectionState = BluetoothProfile.STATE_DISCONNECTED
     private var currentProtocol = BluetoothHidDevice.PROTOCOL_REPORT_MODE
     private val mainHandler = Handler(Looper.getMainLooper())
+    private var connectionAttemptId = 0
+    private val connectionTimeoutMs = 12_000L
 
     private var permissionResult: MethodChannel.Result? = null
     private val PERMISSION_REQUEST_CODE = 1001
@@ -145,6 +152,13 @@ class MainActivity : FlutterActivity() {
         override fun onAppStatusChanged(pluggedDevice: BluetoothDevice?, registered: Boolean) {
             super.onAppStatusChanged(pluggedDevice, registered)
             isAppRegistered = registered
+            isAppRegistrationPending = false
+            sendHidDebugEvent("appRegistration", "registered=$registered")
+            if (registered) {
+                connectPendingDevice()
+            } else {
+                pendingConnectionAddress = null
+            }
             runOnUiThread {
                 channel?.invokeMethod("onAppStatusChanged", registered)
             }
@@ -152,6 +166,9 @@ class MainActivity : FlutterActivity() {
 
         override fun onConnectionStateChanged(device: BluetoothDevice?, state: Int) {
             super.onConnectionStateChanged(device, state)
+            if (state != BluetoothProfile.STATE_CONNECTING) {
+                connectionAttemptId++
+            }
             currentConnectionState = state
             if (state == BluetoothProfile.STATE_CONNECTED) {
                 connectedDevice = device
@@ -232,6 +249,10 @@ class MainActivity : FlutterActivity() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == BluetoothAdapter.ACTION_STATE_CHANGED) {
                 val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
+                if (state == BluetoothAdapter.STATE_ON) {
+                    isHidProfileAvailable = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+                    initHidProfile()
+                }
                 runOnUiThread {
                     channel?.invokeMethod("onBluetoothStateChanged", state == BluetoothAdapter.STATE_ON)
                 }
@@ -266,7 +287,7 @@ class MainActivity : FlutterActivity() {
     override fun onResume() {
         super.onResume()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            if (hidDevice == null) {
+            if (hidDevice == null && isHidProfileAvailable) {
                 initHidProfile()
             } else if (!isAppRegistered) {
                 registerHidApp()
@@ -277,10 +298,25 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun initHidProfile() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            bluetoothAdapter?.getProfileProxy(this, object : BluetoothProfile.ServiceListener {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P ||
+            hidDevice != null ||
+            isHidProfileInitializationPending ||
+            !isHidProfileAvailable ||
+            bluetoothAdapter?.isEnabled != true ||
+            !hasBluetoothConnectPermission()
+        ) {
+            return
+        }
+
+        isHidProfileInitializationPending = true
+        val accepted = bluetoothAdapter?.getProfileProxy(
+            this,
+            object : BluetoothProfile.ServiceListener {
                 override fun onServiceConnected(profile: Int, proxy: BluetoothProfile?) {
                     if (profile == BluetoothProfile.HID_DEVICE) {
+                        hidProfileInitializationAttemptId++
+                        isHidProfileInitializationPending = false
+                        setHidProfileAvailable(true)
                         hidDevice = proxy as BluetoothHidDevice
                         registerHidApp()
                     }
@@ -288,11 +324,50 @@ class MainActivity : FlutterActivity() {
 
                 override fun onServiceDisconnected(profile: Int) {
                     if (profile == BluetoothProfile.HID_DEVICE) {
+                        hidProfileInitializationAttemptId++
+                        isHidProfileInitializationPending = false
                         hidDevice = null
                         isAppRegistered = false
+                        isAppRegistrationPending = false
                     }
                 }
-            }, BluetoothProfile.HID_DEVICE)
+            },
+            BluetoothProfile.HID_DEVICE
+        ) == true
+
+        if (!accepted) {
+            hidProfileInitializationAttemptId++
+            isHidProfileInitializationPending = false
+            setHidProfileAvailable(false)
+            return
+        }
+
+        val attemptId = ++hidProfileInitializationAttemptId
+        mainHandler.postDelayed({
+            if (attemptId != hidProfileInitializationAttemptId ||
+                !isHidProfileInitializationPending ||
+                hidDevice != null
+            ) {
+                return@postDelayed
+            }
+
+            isHidProfileInitializationPending = false
+            pendingConnectionAddress = null
+            connectedDevice = null
+            currentConnectionState = BluetoothProfile.STATE_DISCONNECTED
+            setHidProfileAvailable(false)
+            sendConnectionStateChanged(null, BluetoothProfile.STATE_DISCONNECTED)
+        }, 5_000L)
+    }
+
+    private fun setHidProfileAvailable(available: Boolean) {
+        if (isHidProfileAvailable == available) {
+            return
+        }
+        isHidProfileAvailable = available
+        sendHidDebugEvent("hidProfile", "available=$available")
+        runOnUiThread {
+            channel?.invokeMethod("onHidProfileAvailabilityChanged", available)
         }
     }
 
@@ -301,10 +376,16 @@ class MainActivity : FlutterActivity() {
             bluetoothAdapter?.closeProfileProxy(BluetoothProfile.HID_DEVICE, hidDevice)
             hidDevice = null
         }
+        hidProfileInitializationAttemptId++
+        isHidProfileInitializationPending = false
     }
 
     private fun registerHidApp() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && hidDevice != null && !isAppRegistered) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P &&
+            hidDevice != null &&
+            !isAppRegistered &&
+            !isAppRegistrationPending
+        ) {
             val sdp = BluetoothHidDeviceAppSdpSettings(
                 "AndPad Touchpad",
                 "Virtual Bluetooth Mouse and Keyboard",
@@ -315,9 +396,20 @@ class MainActivity : FlutterActivity() {
             val executor = Executors.newSingleThreadExecutor()
             try {
                 if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
-                    hidDevice?.registerApp(sdp, null, null, executor, hidCallback)
+                    isAppRegistrationPending = hidDevice?.registerApp(
+                        sdp,
+                        null,
+                        null,
+                        executor,
+                        hidCallback
+                    ) == true
+                    sendHidDebugEvent(
+                        "registerApp",
+                        "accepted=$isAppRegistrationPending"
+                    )
                 }
             } catch (e: SecurityException) {
+                isAppRegistrationPending = false
                 e.printStackTrace()
             }
         }
@@ -329,6 +421,7 @@ class MainActivity : FlutterActivity() {
                 if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
                     hidDevice?.unregisterApp()
                     isAppRegistered = false
+                    isAppRegistrationPending = false
                 }
             } catch (e: SecurityException) {
                 e.printStackTrace()
@@ -344,9 +437,12 @@ class MainActivity : FlutterActivity() {
         unregisterHidApp()
         closeHidProfile()
         connectedDevice = null
+        pendingConnectionAddress = null
+        connectionAttemptId++
         currentConnectionState = BluetoothProfile.STATE_DISCONNECTED
         currentProtocol = BluetoothHidDevice.PROTOCOL_REPORT_MODE
         isAppRegistered = false
+        isHidProfileAvailable = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
         mainHandler.postDelayed({
             initHidProfile()
         }, 500)
@@ -358,8 +454,7 @@ class MainActivity : FlutterActivity() {
                 result.success(bluetoothAdapter != null)
             }
             "isHidSupported" -> {
-                val supported = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
-                result.success(supported)
+                result.success(isHidProfileAvailable)
             }
             "isBluetoothEnabled" -> {
                 result.success(bluetoothAdapter?.isEnabled ?: false)
@@ -545,38 +640,134 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun connectDevice(address: String, result: MethodChannel.Result) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P || hidDevice == null) {
-            result.error("HID_NOT_SUPPORTED", "HID is not supported or profile is not initialized", null)
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+            result.error("HID_NOT_SUPPORTED", "HID is not supported", null)
+            return
+        }
+        if (!isHidProfileAvailable) {
+            result.error("HID_NOT_SUPPORTED", "Bluetooth HID Device service is unavailable", null)
+            return
+        }
+        if (!hasBluetoothConnectPermission()) {
+            result.error("PERMISSION_DENIED", "BLUETOOTH_CONNECT permission is required", null)
+            return
+        }
+        if (bluetoothAdapter?.getRemoteDevice(address) == null) {
+            result.error("DEVICE_NOT_FOUND", "Device not found for address $address", null)
+            return
+        }
+
+        pendingConnectionAddress = address
+        currentConnectionState = BluetoothProfile.STATE_CONNECTING
+
+        if (hidDevice == null) {
+            initHidProfile()
+            if (!isHidProfileAvailable) {
+                pendingConnectionAddress = null
+                currentConnectionState = BluetoothProfile.STATE_DISCONNECTED
+                result.error("HID_NOT_SUPPORTED", "Bluetooth HID Device service is unavailable", null)
+                return
+            }
+            sendHidDebugEvent("connect", "queued while HID profile initializes")
+            result.success(true)
             return
         }
         if (!isAppRegistered) {
             registerHidApp()
-            result.success(false)
+            if (!isAppRegistered && !isAppRegistrationPending) {
+                pendingConnectionAddress = null
+                currentConnectionState = BluetoothProfile.STATE_DISCONNECTED
+                result.success(false)
+                return
+            }
+            sendHidDebugEvent("connect", "queued while HID app registers")
+            result.success(true)
             return
         }
-        val device = bluetoothAdapter?.getRemoteDevice(address)
-        if (device == null) {
-            result.error("DEVICE_NOT_FOUND", "Device not found for address $address", null)
-            return
+
+        result.success(connectPendingDevice())
+    }
+
+    private fun connectPendingDevice(): Boolean {
+        val address = pendingConnectionAddress ?: return false
+        val profile = hidDevice ?: return false
+        val device = bluetoothAdapter?.getRemoteDevice(address) ?: run {
+            pendingConnectionAddress = null
+            return false
         }
-        try {
-            if (hasBluetoothConnectPermission()) {
-                val alreadyConnected = hidDevice?.connectedDevices?.any { it.address == address } == true
-                val success = alreadyConnected || (hidDevice?.connect(device) ?: false)
-                if (success || alreadyConnected) {
+
+        return try {
+            if (!hasBluetoothConnectPermission()) {
+                false
+            } else {
+                val alreadyConnected = profile.connectedDevices.any { it.address == address }
+                val accepted = alreadyConnected || profile.connect(device)
+                sendHidDebugEvent(
+                    "connect",
+                    "accepted=$accepted alreadyConnected=$alreadyConnected"
+                )
+                if (accepted) {
+                    pendingConnectionAddress = null
                     connectedDevice = device
                     currentConnectionState = if (alreadyConnected) {
                         BluetoothProfile.STATE_CONNECTED
                     } else {
                         BluetoothProfile.STATE_CONNECTING
                     }
+                    if (!alreadyConnected) {
+                        scheduleConnectionTimeout(device)
+                    }
+                } else {
+                    currentConnectionState = BluetoothProfile.STATE_DISCONNECTED
                 }
-                result.success(success)
-            } else {
-                result.error("PERMISSION_DENIED", "BLUETOOTH_CONNECT permission is required", null)
+                accepted
             }
         } catch (e: SecurityException) {
-            result.error("SECURITY_EXCEPTION", e.message, null)
+            currentConnectionState = BluetoothProfile.STATE_DISCONNECTED
+            false
+        }
+    }
+
+    private fun scheduleConnectionTimeout(device: BluetoothDevice) {
+        val attemptId = ++connectionAttemptId
+        mainHandler.postDelayed({
+            if (attemptId != connectionAttemptId ||
+                currentConnectionState != BluetoothProfile.STATE_CONNECTING
+            ) {
+                return@postDelayed
+            }
+
+            try {
+                val connected = hasBluetoothConnectPermission() &&
+                    hidDevice?.connectedDevices?.any { it.address == device.address } == true
+                if (connected) {
+                    connectedDevice = device
+                    currentConnectionState = BluetoothProfile.STATE_CONNECTED
+                    sendConnectionStateChanged(device, BluetoothProfile.STATE_CONNECTED)
+                } else {
+                    if (hasBluetoothConnectPermission()) {
+                        hidDevice?.disconnect(device)
+                    }
+                    connectedDevice = null
+                    currentConnectionState = BluetoothProfile.STATE_DISCONNECTED
+                    sendHidDebugEvent("connectTimeout", "device=${device.name ?: ""}")
+                    sendConnectionStateChanged(device, BluetoothProfile.STATE_DISCONNECTED)
+                }
+            } catch (e: SecurityException) {
+                connectedDevice = null
+                currentConnectionState = BluetoothProfile.STATE_DISCONNECTED
+                sendConnectionStateChanged(device, BluetoothProfile.STATE_DISCONNECTED)
+            }
+        }, connectionTimeoutMs)
+    }
+
+    private fun sendConnectionStateChanged(device: BluetoothDevice?, state: Int) {
+        runOnUiThread {
+            channel?.invokeMethod("onConnectionStateChanged", mapOf(
+                "state" to state,
+                "deviceName" to (device?.name ?: ""),
+                "deviceAddress" to (device?.address ?: "")
+            ))
         }
     }
 

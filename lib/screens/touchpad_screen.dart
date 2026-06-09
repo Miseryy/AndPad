@@ -151,6 +151,18 @@ class _TouchpadScreenState extends State<TouchpadScreen>
       _showToast(enabled ? "Bluetooth enabled" : "Bluetooth disabled");
     };
 
+    _hidManager.onHidProfileAvailabilityChanged = (available) {
+      _stopAutoReconnect();
+      setState(() {
+        _isHidSupported = available;
+        if (!available) {
+          _connectionState = BluetoothHidManager.stateDisconnected;
+          _connectedDeviceName = "";
+          _connectedDeviceAddress = "";
+        }
+      });
+    };
+
     _hidManager.onAppStatusChanged = (registered) {
       debugPrint("HID app registered: $registered");
     };
@@ -212,6 +224,9 @@ class _TouchpadScreenState extends State<TouchpadScreen>
         _stopAutoReconnect();
         return;
       }
+      if (_connectionState == BluetoothHidManager.stateConnecting) {
+        return;
+      }
 
       if (_reconnectAttempts >= maxReconnectAttempts) {
         _stopAutoReconnect();
@@ -224,10 +239,14 @@ class _TouchpadScreenState extends State<TouchpadScreen>
         "Reconnecting to $_lastDeviceName ($_reconnectAttempts/$maxReconnectAttempts)...",
       );
 
-      final success = await _attemptReconnect(
-        resetTransport: _reconnectAttempts >= 3,
-      );
-      if (success) {
+      await _attemptReconnect(resetTransport: _reconnectAttempts >= 3);
+      final state = await _hidManager.getConnectionState();
+      if (mounted) {
+        setState(() {
+          _connectionState = state;
+        });
+      }
+      if (state == BluetoothHidManager.stateConnected) {
         _stopAutoReconnect();
       }
     });
@@ -900,7 +919,14 @@ class _TouchpadScreenState extends State<TouchpadScreen>
                                   _connectedDeviceName = device['name'] ?? "PC";
                                   _connectedDeviceAddress =
                                       device['address'] ?? "";
+                                  _lastDeviceName = device['name'] ?? "PC";
+                                  _lastDeviceAddress = device['address'] ?? "";
                                 });
+                                _saveSetting('lastDeviceName', _lastDeviceName);
+                                _saveSetting(
+                                  'lastDeviceAddress',
+                                  _lastDeviceAddress,
+                                );
                                 _stopAutoReconnect();
                                 final ok = await _hidManager.connectDevice(
                                   device['address']!,
